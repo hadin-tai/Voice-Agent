@@ -1,0 +1,38 @@
+How to activate anam
+
+## Deliverables Report
+### 1. Files Modified
+backend/agent/worker.py
+
+### 2. Exact Changes Made Change 1: Add ANAM_ENABLED flag
+- Line 27 : Added ANAM_ENABLED = False
+- Old code (no flag) :
+- New code (with flag) :
+- Reason : Added simple, easy-to-switch flag to control avatar integration Change 2: Wrap ANAM initialization in ANAM_ENABLED check
+- Lines 612-657 : Wrapped entire ANAM block in if ANAM_ENABLED:
+- Old code (without check) :
+- New code (with check) :
+- Reason : Temporarily skips creating/starting avatar session
+### 3. Why This Does Not Break the Agent
+- LiveKit Still Works : The AgentSession is still created and started normally
+- STT Still Works : The stt parameter is untouched
+- TTS Still Works : The tts parameter is untouched
+- Tool Calling Still Works : The function tools and agent logic are unchanged
+- Only Avatar Connection Disabled : We just skip creating/starting anam.AvatarSession
+### 4. How to Re-enable the Avatar Later
+Simply change line 27 from:
+
+```
+ANAM_ENABLED = False
+```
+to:
+
+```
+ANAM_ENABLED = True
+```
+### 5. Verify After Changes
+When you run the worker, you should see:
+✅ [ANAM] Enabled: False ✅ [ANAM] Avatar integration temporarily disabled for debugging.
+
+And you WILL NOT see:
+❌ [ANAM] ===== ENTERED ANAM INITIALIZATION ===== ❌ [ANAM] Joining room ❌ [ANAM] Connected ❌ [ANAM] Avatar session started
