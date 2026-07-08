@@ -693,7 +693,8 @@ async def entrypoint(ctx: JobContext):
         llm=llm_instance,
         # tts=cartesia.TTS(),
         tts=cartesia.TTS(
-            voice="56e35e2d-6eb6-4226-ab8b-9776515a7094",
+            # voice="56e35e2d-6eb6-4226-ab8b-9776515a7094",
+            voice=os.getenv("CARTESIA_VOICE_ID"),
         ),
         vad=silero.VAD.load(),
         preemptive_generation=False,

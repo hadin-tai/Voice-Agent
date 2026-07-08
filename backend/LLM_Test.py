@@ -1,7 +1,7 @@
 import time
 from huggingface_hub import InferenceClient
 import os
-import dotenv
+from dotenv import load_dotenv
 load_dotenv()
 
 # Your Hugging Face token

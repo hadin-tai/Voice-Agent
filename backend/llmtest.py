@@ -3,7 +3,7 @@ import json
 
 from huggingface_hub.utils import BadRequestError
 import os
-import dotenv
+from dotenv import load_dotenv
 load_dotenv()
 
 # Your Hugging Face token
