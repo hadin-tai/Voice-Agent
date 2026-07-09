@@ -20,7 +20,7 @@ LiveKit Agent Worker
 └──────────────┘
     │
     ▼
-Gemini 2.5 Flash Lite
+HUggingface LLM
     │
     ▼
 Cartesia TTS
