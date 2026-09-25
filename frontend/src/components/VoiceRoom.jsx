@@ -1,3 +1,4 @@
+
 import React, { useState, useRef, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import {
@@ -13,9 +14,18 @@ import {
 import { getToken } from '../api';
 import './VoiceRoom.css';
 
+// Helper to generate random room name
+const generateRandomRoomName = () => {
+  const prefixes = ['room', 'voice', 'meeting', 'session'];
+  const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+  const random = Math.random().toString(36).substring(2, 7);
+  return `${prefix}-${random}`;
+};
+
 const VoiceRoom = () => {
-  const [roomName, setRoomName] = useState('test-room');
-  const [identity, setIdentity] = useState(`user-${Math.random().toString(36).substring(2, 8)}`);
+  const [roomName, setRoomName] = useState(() => generateRandomRoomName());
+  // const [identity, setIdentity] = useState(`user-${Math.random().toString(36).substring(2, 8)}`);
+  const [identity, setIdentity] = useState(`default_user`);
   const [isConnected, setIsConnected] = useState(false);
   const [token, setToken] = useState(null);
   const [url, setUrl] = useState(null);
@@ -30,6 +40,12 @@ const VoiceRoom = () => {
       setSelectedDoc({ id: docId, name: docName });
     }
   }, []);
+
+  const clearSelectedDoc = () => {
+    setSelectedDoc(null);
+    localStorage.removeItem('selectedDocumentId');
+    localStorage.removeItem('selectedDocumentName');
+  };
 
   const handleConnect = async () => {
     try {
@@ -80,6 +96,9 @@ const VoiceRoom = () => {
             <div className="selected-doc-badge">
               <span className="doc-icon">📄</span>
               <span className="doc-name">{selectedDoc.name}</span>
+              <button className="clear-doc-btn" onClick={clearSelectedDoc} title="Clear document selection">
+                ×
+              </button>
             </div>
           )}
           <Link to="/documents" className="manage-docs-button">
@@ -146,7 +165,7 @@ const VoiceRoom = () => {
             audio={true}
             style={{ width: '100%', height: '100%' }}
           >
-            <ConnectedView setStatus={setStatus} roomNameFromParent={roomName} />
+            <ConnectedView setStatus={setStatus} roomNameFromParent={roomName} selectedDoc={selectedDoc} />
             <RoomAudioRenderer />
             <div className="control-bar-wrapper">
               <ControlBar />
@@ -159,7 +178,7 @@ const VoiceRoom = () => {
 };
 
 // Connected View Component
-const ConnectedView = ({ setStatus, roomNameFromParent }) => {
+const ConnectedView = ({ setStatus, roomNameFromParent, selectedDoc }) => {
   const connectionState = useConnectionState();
   const voiceAssistant = useVoiceAssistant();
   
@@ -172,13 +191,19 @@ const ConnectedView = ({ setStatus, roomNameFromParent }) => {
   }, [voiceAssistant]);
 
   // Try all possible state properties
-  let state = 'idle';
+  let voiceState = 'idle';
   if (voiceAssistant) {
-    if (voiceAssistant.state) state = voiceAssistant.state;
-    if (voiceAssistant.agent?.state) state = voiceAssistant.agent.state;
-    if (voiceAssistant.agentState) state = voiceAssistant.agentState;
-    if (voiceAssistant.agent_state) state = voiceAssistant.agent_state;
+    if (voiceAssistant.state) voiceState = voiceAssistant.state;
+    if (voiceAssistant.agent?.state) voiceState = voiceAssistant.agent.state;
+    if (voiceAssistant.agentState) voiceState = voiceAssistant.agentState;
+    if (voiceAssistant.agent_state) voiceState = voiceAssistant.agent_state;
   }
+
+  // Custom state with detailed info
+  const [detailedState, setDetailedState] = useState({
+    status: 'idle',
+    toolName: null
+  });
 
   const messages = voiceAssistant?.messages || [];
   const transcriptEndRef = useRef(null);
@@ -186,9 +211,36 @@ const ConnectedView = ({ setStatus, roomNameFromParent }) => {
   const { localParticipant, microphoneTrack } = useLocalParticipant();
   const remoteParticipants = useParticipants();
 
+  // Listen to data packets for agent status
   useEffect(() => {
-    console.log("[FINAL VOICE ASSISTANT STATE]", state);
-  }, [state]);
+    if (!roomContext) return;
+
+    const handleDataReceived = (payload, participant, kind) => {
+      try {
+        const data = JSON.parse(new TextDecoder().decode(payload));
+        if (data.type === "agent_status") {
+          console.log("[AGENT STATUS RECEIVED]", data);
+          setDetailedState({
+            status: data.status,
+            toolName: data.tool_name || null
+          });
+        }
+      } catch (e) {
+        console.error("[DATA PARSE ERROR]", e);
+      }
+    };
+
+    roomContext.on('dataReceived', handleDataReceived);
+
+    return () => {
+      roomContext.off('dataReceived', handleDataReceived);
+    };
+  }, [roomContext]);
+
+  useEffect(() => {
+    console.log("[FINAL VOICE ASSISTANT STATE]", voiceState);
+    console.log("[DETAILED AGENT STATE]", detailedState);
+  }, [voiceState, detailedState]);
 
   // Log room info and LIVEKIT URL match with worker
   useEffect(() => {
@@ -267,47 +319,135 @@ const ConnectedView = ({ setStatus, roomNameFromParent }) => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // Helper to get icon and text based on detailed state
+  const getDetailedStateIcon = (detailedState) => {
+    switch (detailedState.status) {
+      case 'listening': return '👂';
+      case 'speaking': return '🔊';
+      case 'thinking': return '🤔';
+      case 'calling_tool': return '🔧';
+      case 'generating_response': return '✨';
+      case 'tool_failed': return '❌';
+      default: return '🎧';
+    }
+  };
+
+  const getDetailedStateText = (detailedState) => {
+    switch (detailedState.status) {
+      case 'listening': return 'Listening...';
+      case 'speaking': return 'Speaking...';
+      case 'thinking': return 'Thinking...';
+      case 'calling_tool':
+        return `Please wait, Calling Tool${detailedState.toolName ? `: ${detailedState.toolName}` : ''}...`;
+      case 'generating_response': return 'Generating Response...';
+      case 'tool_failed': return 'Tool Failed';
+      default: return 'Ready to talk';
+    }
+  };
+
+  // Separate agent participant from others: PRIORITIZE anam-avatar-agent!
+  const agentParticipant = remoteParticipants.find(
+    (p) => p.identity === 'anam-avatar-agent'
+  ) || remoteParticipants.find(
+    (p) => 
+      p.identity.startsWith('agent-') || 
+      p.identity === 'voice-agent-rag'
+  );
+  // Filter out avatar participant from badge list entirely!
+  const otherParticipants = remoteParticipants.filter(
+    (p) => 
+      !(p.identity === 'anam-avatar-agent') &&
+      (!agentParticipant || p.identity !== agentParticipant.identity)
+  );
+  // Ensure no duplicates (in case remoteParticipants includes local)
+  const seenIdentities = new Set();
+  const uniqueParticipants = [];
+  if (localParticipant && !seenIdentities.has(localParticipant.identity)) {
+    seenIdentities.add(localParticipant.identity);
+    uniqueParticipants.push(localParticipant);
+  }
+  otherParticipants.forEach(p => {
+    if (!seenIdentities.has(p.identity)) {
+      seenIdentities.add(p.identity);
+      uniqueParticipants.push(p);
+    }
+  });
+  const allHumanParticipants = uniqueParticipants;
+
   return (
     <div className="connected-view">
-      {/* Remote Participants Section */}
-      <div className="participants-section">
-        <h3>Participants</h3>
-        <div className="participants-grid">
-          {remoteParticipants.map((participant) => (
-            <ParticipantView key={participant.identity} participant={participant} />
-          ))}
+      {/* Selected Document Display (below header) */}
+      {/* {selectedDoc && (
+        <div className="selected-doc-display glass">
+          <span className="doc-icon">📄</span>
+          <span className="doc-name">{selectedDoc.name}</span>
         </div>
-      </div>
+      )} */}
 
-      <div className="visualization-section">
-        <VoiceVisualization state={state} />
-        <div className="state-indicator">
-          <div className="state-icon">{getStateIcon(state)}</div>
-          <div className="state-text">{getStateText(state)}</div>
-        </div>
-      </div>
-
-      <div className="transcripts-panel glass">
-        <h3>Conversation</h3>
-        <div className="transcripts-list">
-          {messages.length === 0 ? (
-            <div className="empty-state">
-              <div className="empty-icon">💬</div>
-              <p>Start speaking to see your conversation here</p>
-            </div>
+      {/* Main content: Avatar and status */}
+      <div className="main-content">
+        {/* Avatar Container */}
+        <div className="avatar-container glass">
+          {agentParticipant ? (
+            <ParticipantView key={agentParticipant.identity} participant={agentParticipant} isAgent={true} />
           ) : (
-            messages.map((msg, idx) => (
-              <Message key={idx} message={msg} />
-            ))
+            <div className="avatar-placeholder">
+              <div className="avatar-placeholder-icon">🤖</div>
+            </div>
           )}
-          <div ref={transcriptEndRef} />
+        </div>
+
+        {/* Status Display */}
+        <div className={`status-display ${detailedState.status}`}>
+          <div className="status-icon">{getDetailedStateIcon(detailedState)}</div>
+          <div className="status-text">{getDetailedStateText(detailedState)}</div>
+          {/* Animated indicator based on state */}
+          <div className="status-animator">
+            {detailedState.status === 'listening' && (
+              <div className="wave-animation">
+                {[...Array(5)].map((_, i) => (
+                  <div key={i} className="wave-bar" style={{ animationDelay: `${i * 0.1}s` }}></div>
+                ))}
+              </div>
+            )}
+            {detailedState.status === 'thinking' && (
+              <div className="dots-animation">
+                <div className="dot"></div>
+                <div className="dot"></div>
+                <div className="dot"></div>
+              </div>
+            )}
+            {detailedState.status === 'speaking' && (
+              <div className="wave-animation speaking">
+                {[...Array(7)].map((_, i) => (
+                  <div key={i} className="wave-bar" style={{ animationDelay: `${i * 0.08}s` }}></div>
+                ))}
+              </div>
+            )}
+            {detailedState.status === 'calling_tool' && (
+              <div className="spinner-animation"></div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Participants as badges */}
+      <div className="participants-badges">
+        <div className="participants-label">Connected</div>
+        <div className="badges-list">
+          {allHumanParticipants.map((participant, idx) => (
+            <div key={participant.sid || participant.identity || idx} className="participant-badge">
+              <div className="badge-icon">👤</div>
+              <span>{participant.identity}</span>
+            </div>
+          ))}
         </div>
       </div>
     </div>
   );
 };
 
-// Message Component
+// Message Component (still exists for possible future use)
 const Message = ({ message }) => {
   if (!message || !message.text) return null;
   
@@ -330,55 +470,8 @@ const Message = ({ message }) => {
   );
 };
 
-// Voice Visualization Component
-const VoiceVisualization = ({ state }) => {
-  const isListening = state === 'listening';
-  const isSpeaking = state === 'speaking';
-
-  return (
-    <div className={`visualization-container ${state === 'idle' ? 'breathe' : ''}`}>
-      <div className={`voice-orb ${isListening ? 'listening' : ''} ${isSpeaking ? 'speaking' : ''}`}>
-        <div className="pulse-ring"></div>
-        <div className="pulse-ring"></div>
-        <div className="pulse-ring"></div>
-        <div className="mic-icon">{isSpeaking ? '🤖' : '🎤'}</div>
-      </div>
-      <div className="wave-form">
-        {[...Array(12)].map((_, i) => (
-          <div
-            key={i}
-            className={`wave-bar ${isListening || isSpeaking ? 'active' : ''}`}
-            style={{
-              animation: `wave 0.8s ease-in-out ${i * 0.05}s infinite`
-            }}
-          />
-        ))}
-      </div>
-    </div>
-  );
-};
-
-// Helper Functions
-const getStateIcon = (state) => {
-  switch (state) {
-    case 'listening': return '👂';
-    case 'speaking': return '🔊';
-    case 'thinking': return '🤔';
-    default: return '🎧';
-  }
-};
-
-const getStateText = (state) => {
-  switch (state) {
-    case 'listening': return 'Listening...';
-    case 'speaking': return 'Speaking...';
-    case 'thinking': return 'Thinking...';
-    default: return 'Ready to talk';
-  }
-};
-
-// Participant View Component
-const ParticipantView = ({ participant }) => {
+// Participant View Component (updated)
+const ParticipantView = ({ participant, isAgent }) => {
   const videoRef = useRef(null);
   const audioRef = useRef(null);
 
@@ -387,7 +480,7 @@ const ParticipantView = ({ participant }) => {
       console.log("[ParticipantView] Track published:", publication.trackSid, publication.kind);
     };
 
-    const handleTrackSubscribed = (track) => {
+    const handleTrackSubscribed = (track, publication) => {
       console.log("[ParticipantView] Track subscribed:", track.sid, track.kind);
       if (track.kind === 'video' && videoRef.current) {
         track.attach(videoRef.current);
@@ -397,7 +490,7 @@ const ParticipantView = ({ participant }) => {
       }
     };
 
-    const handleTrackUnsubscribed = (track) => {
+    const handleTrackUnsubscribed = (track, publication) => {
       console.log("[ParticipantView] Track unsubscribed:", track.sid, track.kind);
       if (track.kind === 'video' && videoRef.current) {
         track.detach(videoRef.current);
@@ -416,7 +509,7 @@ const ParticipantView = ({ participant }) => {
       const subscribedTracks = Array.from(participant.tracks.values());
       subscribedTracks.forEach((publication) => {
         if (publication.track) {
-          handleTrackSubscribed(publication.track);
+          handleTrackSubscribed(publication.track, publication);
         }
       });
     }
@@ -428,15 +521,16 @@ const ParticipantView = ({ participant }) => {
     };
   }, [participant]);
 
-  return (
-    <div className="participant-tile-wrapper">
-      <div className="participant-tile">
-        <video ref={videoRef} className="participant-video" autoPlay playsInline muted />
+  if (isAgent) {
+    return (
+      <div className="agent-video-container">
+        <video ref={videoRef} className="agent-video" autoPlay playsInline muted />
         <audio ref={audioRef} autoPlay />
       </div>
-      <div className="participant-name">{participant.identity}</div>
-    </div>
-  );
+    );
+  }
+
+  return null;
 };
 
 export default VoiceRoom;

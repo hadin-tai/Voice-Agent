@@ -1,6 +1,7 @@
 import os
 import logging
 from huggingface_hub import InferenceClient
+from app.config import settings
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -18,7 +19,7 @@ if not logger.handlers:
 # Initialize HuggingFace client
 HF_TOKEN = os.getenv("HF_TOKEN")
 # MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
-MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
+MODEL_NAME = settings.HF_LLM_MODEL
 # MODEL_NAME = "deepseek-ai/DeepSeek-R1"
 logger.info("Using HuggingFace LLM")
 logger.info(f"Model: {MODEL_NAME}")

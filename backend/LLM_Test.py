@@ -23,8 +23,9 @@ MODELS = [
     # "mistralai/Mixtral-8x7B-Instruct-v0.1", # Failed
 
     # "meta-llama/Meta-Llama-3.1-8B-Instruct", # Fast response with good enogh reasoning
-    "meta-llama/Llama-3.1-8B-Instruct", # Fast response with good enogh reasoning
-    "Qwen/Qwen2.5-7B-Instruct",
+    # "meta-llama/Llama-3.1-8B-Instruct", # Fast response with good enogh reasoning
+    # "Qwen/Qwen2.5-7B-Instruct",
+    "zai-org/GLM-5.2",
 ]
 
 QUESTION = "What is the capital of India?"

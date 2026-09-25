@@ -24,12 +24,14 @@ class TokenResponse(BaseModel):
 @router.post("/token", response_model=TokenResponse)
 async def generate_token(request: TokenRequest):
     start_time = time.perf_counter()
+    logger.info("=============== TOKEN GENERATION REQUEST ===============")
     logger.info("Token generation request received", extra={
         "identity": request.identity,
         "room_name": request.room_name,
         "metadata": request.metadata
     })
     try:
+        logger.info(f"[TOKEN] Building token for room_name: '{request.room_name}'")
         token_builder = (
             api.AccessToken(
                 api_key=settings.LIVEKIT_API_KEY,
@@ -43,7 +45,8 @@ async def generate_token(request: TokenRequest):
                 )
             )
         )
-        
+        print("Room name (in token builder):", request.room_name)
+        logger.info(f"[TOKEN] Token builder grants: room = '{request.room_name}'")
         if request.metadata:
             token_builder = token_builder.with_metadata(json.dumps(request.metadata))
 

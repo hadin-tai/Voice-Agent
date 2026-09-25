@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     ASSISTANT_NAME: str = "voice-agent-rag"
     RAG_API_URL: str = "http://localhost:8000/api/rag/search"
     HF_TOKEN: str = os.getenv("HF_TOKEN")
+    HF_LLM_MODEL: str = os.getenv("HF_LLM_MODEL")
     CARTESIA_VOICE_ID: str = os.getenv("CARTESIA_VOICE_ID")
 
     class Config:

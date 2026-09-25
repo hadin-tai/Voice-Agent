@@ -17,7 +17,6 @@ BACKEND_DIR = Path(__file__).parent.parent
 sys.path.append(str(BACKEND_DIR))
 
 # Configuration flags
-# ANAM_ENABLED = False
 ANAM_ENABLED = True
 DEBUG = False  # Set to True for debug logs
 VERBOSE_LOGGING = False  # Set to True for very verbose logs
@@ -33,6 +32,7 @@ from livekit.agents import (
     ConversationItemAddedEvent,
     function_tool,
 )
+from livekit.agents.voice.room_io import RoomInputOptions
 
 from livekit.plugins import (
     speechmatics,
@@ -122,7 +122,7 @@ class HuggingFaceLLM(llm.LLM):
     def __init__(
         self,
         *,
-        model: str = "Qwen/Qwen2.5-7B-Instruct",
+        model: str = settings.HF_LLM_MODEL,
         api_key: str | None = None,
         provider: str = "auto",
         temperature: float = 0.7,
@@ -201,12 +201,67 @@ class HuggingFaceLLMStream(llm.LLMStream):
 
     async def _generate_once(self, chat_ctx_list, openai_tools, hf_tool_choice):
         import time
+        import json
         start_time = time.time()
         full_response = ""
         num_chunks = 0
         first_chunk_latency = None
         # Dictionary to accumulate partial tool calls (key is index)
         partial_tool_calls = {}
+        # Set to track emitted call_ids to avoid duplicates
+        emitted_call_ids = set()
+
+        def is_valid_json(s: str) -> bool:
+            try:
+                json.loads(s)
+                return True
+            except Exception:
+                return False
+
+        async def flush_pending_tool_calls():
+            """Emit any valid, completed tool calls from partial_tool_calls"""
+            delta_tool_calls = []
+            for tc_index in list(partial_tool_calls.keys()):
+                ptc = partial_tool_calls[tc_index]
+                call_id = ptc.get("call_id")
+                name = ptc.get("name")
+                arguments = ptc.get("arguments", "")
+
+                if not call_id or not name:
+                    continue
+                if call_id in emitted_call_ids:
+                    llm_logger.info(f"[TOOL CALL] Duplicate call_id ignored: {call_id}")
+                    continue
+                if not is_valid_json(arguments):
+                    llm_logger.info(f"[TOOL CALL] JSON not valid yet for {call_id}: {repr(arguments)}")
+                    continue
+
+                # Valid, add to delta_tool_calls
+                llm_logger.info(f"[TOOL CALL] JSON validated for {call_id}: {repr(arguments)}")
+                fn_tool_call = llm.FunctionToolCall(
+                    type="function",
+                    name=name,
+                    arguments=arguments,
+                    call_id=call_id,
+                    extra=None
+                )
+                delta_tool_calls.append(fn_tool_call)
+                emitted_call_ids.add(call_id)
+                llm_logger.info(f"[TOOL CALL] Emitting: {call_id} ({name})")
+
+                # Remove from partial to avoid re-emitting
+                del partial_tool_calls[tc_index]
+
+            if delta_tool_calls:
+                chat_chunk = llm.ChatChunk(
+                    id=f"flush-{num_chunks}",
+                    delta=llm.ChoiceDelta(
+                        content=None,
+                        role="assistant",
+                        tool_calls=delta_tool_calls,
+                    ),
+                )
+                self._event_ch.send_nowait(chat_chunk)
 
         try:
             if VERBOSE_LOGGING:
@@ -277,7 +332,7 @@ class HuggingFaceLLMStream(llm.LLMStream):
 
                 try:
                     delta_content = None
-                    delta_tool_calls = []
+                    finish_reason = None
                     
                     if hasattr(chunk, 'choices') and chunk.choices:
                         choice = chunk.choices[0]
@@ -288,8 +343,6 @@ class HuggingFaceLLMStream(llm.LLMStream):
                             
                             # Detect tool calls and accumulate them
                             if hasattr(delta, 'tool_calls') and delta.tool_calls:
-                                if VERBOSE_LOGGING:
-                                    llm_logger.info("TOOL CALL DETECTED IN CHUNK")
                                 for tc in delta.tool_calls:
                                     tc_index = getattr(tc, 'index', 0)
                                     
@@ -300,61 +353,58 @@ class HuggingFaceLLMStream(llm.LLMStream):
                                             "name": None,
                                             "arguments": ""
                                         }
+                                        llm_logger.info(f"[TOOL CALL] Initialized partial tool call at index {tc_index}")
                                     
                                     # Update call_id if present
                                     if hasattr(tc, 'id') and tc.id is not None:
                                         partial_tool_calls[tc_index]["call_id"] = tc.id
+                                        llm_logger.info(f"[TOOL CALL] Updated call_id at index {tc_index}: {tc.id}")
                                     
                                     # Update function name and arguments if present
                                     if hasattr(tc, 'function'):
                                         func = tc.function
                                         if hasattr(func, 'name') and func.name is not None:
                                             partial_tool_calls[tc_index]["name"] = func.name
+                                            llm_logger.info(f"[TOOL CALL] Updated name at index {tc_index}: {func.name}")
                                         if hasattr(func, 'arguments') and func.arguments is not None:
                                             partial_tool_calls[tc_index]["arguments"] += func.arguments
-                                    
-                                    ptc = partial_tool_calls[tc_index]
-                                    if ptc["call_id"] is not None and ptc["name"] is not None:
-                                        fn_tool_call = llm.FunctionToolCall(
-                                            type="function",
-                                            name=ptc["name"],
-                                            arguments=ptc["arguments"],
-                                            call_id=ptc["call_id"],
-                                            extra=None
-                                        )
-                                        delta_tool_calls.append(fn_tool_call)
+                                            llm_logger.info(f"[TOOL CALL] Accumulated arguments at index {tc_index}: {repr(partial_tool_calls[tc_index]['arguments'])}")
                         elif hasattr(choice, 'text'):
                             delta_content = choice.text
+                        
+                        if hasattr(choice, 'finish_reason'):
+                            finish_reason = choice.finish_reason
+                            # llm_logger.info(f"[TOOL CALL] Finish reason received: {finish_reason}")
                     elif hasattr(chunk, 'delta'):
                         delta = chunk.delta
                         if hasattr(delta, 'content'):
                             delta_content = delta.content
 
-                    if delta_content or delta_tool_calls:
-                        if delta_content:
-                            full_response += delta_content
-                        
-                        if VERBOSE_LOGGING:
-                            llm_logger.info("Creating ChatChunk")
-                            llm_logger.info(f"tool_calls={delta_tool_calls}")
-                            llm_logger.info(f"content={delta_content}")
-                        
+                    if delta_content:
+                        full_response += delta_content
                         chat_chunk = llm.ChatChunk(
                             id=getattr(chunk, 'id', f"chunk-{num_chunks}"),
                             delta=llm.ChoiceDelta(
                                 content=delta_content,
                                 role="assistant",
-                                tool_calls=delta_tool_calls,
+                                tool_calls=[],
                             ),
                         )
-                        if VERBOSE_LOGGING:
-                            llm_logger.info("Emitting chunk to event channel")
                         self._event_ch.send_nowait(chat_chunk)
+                    
+                    if finish_reason in ["tool_calls", "stop"]:
+                        llm_logger.info("[TOOL CALL] Flushing pending tool calls due to finish reason")
+                        await flush_pending_tool_calls()
+
                 except Exception as parse_e:
                     llm_logger.warning(f"[LLM WARNING] Failed to parse chunk: {parse_e}")
                     if VERBOSE_LOGGING:
                         llm_logger.warning(f"[LLM WARNING] Parse error traceback:\n{traceback.format_exc()}")
                     continue
+
+            # Flush remaining pending tool calls at end of stream
+            llm_logger.info("[TOOL CALL] End of stream, flushing pending tool calls")
+            await flush_pending_tool_calls()
 
             total_latency = time.time() - start_time
             if VERBOSE_LOGGING:
@@ -450,6 +500,59 @@ class HuggingFaceLLMStream(llm.LLMStream):
                 llm_logger.warning(f"[LLM WARNING] Failed to close event channel: {close_e}")
 
 
+# # Define function tools
+# @function_tool
+# async def assign_name_2_speaker_ids(
+#     name: Annotated[
+#         str,
+#         "The name of the current speaker to remember",
+#     ],
+# ) -> str:
+#     """Assigns a human-readable name to the current speaker; call this ONLY when the user says their own name (e.g., "My name is X", "I am X", "Call me X") and NOT when they mention someone else's name, ask questions, or discuss general topics."""
+#     logger.info(f"[TOOL] assign_name_2_speaker_ids() called with name: {name}")
+    
+#     global stt, known_speakers
+#     if not stt:
+#         logger.error("[TOOL] STT not initialized")
+#         raise RuntimeError("STT not initialized")
+    
+#     logger.info("[STT] Calling get_speaker_ids()")
+#     raw_speaker_ids = await stt.get_speaker_ids()
+#     speaker_ids = normalize_speaker_ids(raw_speaker_ids)
+
+#     logger.info(f"[STT] Normalized speaker ids count: {len(speaker_ids)}")
+    
+#     updated_speakers = list(known_speakers)
+#     found = False
+    
+#     for i, speaker in enumerate(updated_speakers):
+#         if speaker.label.lower() == name.lower():
+#             current_ids = set(speaker.speaker_identifiers)
+#             current_ids.update(speaker_ids)
+            
+#             updated_speakers[i] = SpeakerIdentifier(
+#                 label=speaker.label,
+#                 speaker_identifiers=list(current_ids),
+#             )
+#             found = True
+#             logger.info(f"[SPEAKER] Updated {name}")
+#             logger.info(f"[SPEAKER] Identifiers: {updated_speakers[i].speaker_identifiers}")
+#             break
+    
+#     if not found:
+#         new_speaker = SpeakerIdentifier(
+#             label=name,
+#             speaker_identifiers=speaker_ids,
+#         )
+#         updated_speakers.append(new_speaker)
+#         logger.info(f"[SPEAKER] Created new {name}")
+#         logger.info(f"[SPEAKER] Identifiers: {new_speaker.speaker_identifiers}")
+    
+#     known_speakers = updated_speakers
+#     save_speakers(SPEAKERS_FILE, updated_speakers)
+    
+#     return f"Got it! I'll remember you as {name}."
+
 # Define function tools
 @function_tool
 async def assign_name_2_speaker_ids(
@@ -458,49 +561,194 @@ async def assign_name_2_speaker_ids(
         "The name of the current speaker to remember",
     ],
 ) -> str:
-    """Assigns a human-readable name to the current speaker; call this ONLY when the user says their own name (e.g., "My name is X", "I am X", "Call me X") and NOT when they mention someone else's name, ask questions, or discuss general topics."""
-    logger.info(f"[TOOL] assign_name_2_speaker_ids() called with name: {name}")
-    
+    """
+    Assigns a human-readable name to the current speaker.
+
+    Call ONLY when the user is introducing themselves:
+    - My name is John
+    - I am John
+    - Call me John
+
+    Never call for names of other people.
+    """
+
+    logger.info(f"[TOOL] assign_name_2_speaker_ids() called with raw name: {name}")
+
     global stt, known_speakers
+
     if not stt:
         logger.error("[TOOL] STT not initialized")
         raise RuntimeError("STT not initialized")
-    
-    logger.info("[STT] Calling get_speaker_ids()")
-    raw_speaker_ids = await stt.get_speaker_ids()
-    speaker_ids = normalize_speaker_ids(raw_speaker_ids)
 
-    logger.info(f"[STT] Normalized speaker ids count: {len(speaker_ids)}")
-    
-    updated_speakers = list(known_speakers)
-    found = False
-    
-    for i, speaker in enumerate(updated_speakers):
-        if speaker.label.lower() == name.lower():
-            current_ids = set(speaker.speaker_identifiers)
-            current_ids.update(speaker_ids)
-            
-            updated_speakers[i] = SpeakerIdentifier(
-                label=speaker.label,
-                speaker_identifiers=list(current_ids),
-            )
-            found = True
-            logger.info(f"[SPEAKER] Updated {name}")
-            logger.info(f"[SPEAKER] Identifiers: {updated_speakers[i].speaker_identifiers}")
-            break
-    
-    if not found:
-        new_speaker = SpeakerIdentifier(
-            label=name,
-            speaker_identifiers=speaker_ids,
+    # ------------------------------------------------------------------
+    # Normalize name
+    # ------------------------------------------------------------------
+    name = (name or "").strip()
+
+    if not name:
+        logger.warning("[TOOL] Empty name received.")
+        return "Sorry, I didn't catch your name."
+
+    # Remove surrounding punctuation
+    name = name.strip(".,!?\"' ")
+
+    # Remove duplicated whitespace
+    name = " ".join(name.split())
+
+    # Reject clearly invalid names
+    INVALID_NAMES = {
+        "my",
+        "name",
+        "is",
+        "was",
+        "i",
+        "me",
+        "call",
+        "unknown",
+        "speaker",
+        "user",
+        "person",
+    }
+
+    if name.lower() in INVALID_NAMES:
+        logger.warning(f"[TOOL] Ignoring invalid extracted name: {name}")
+        return "Sorry, I couldn't determine your name."
+
+    logger.info(f"[TOOL] Normalized name: {name}")
+
+    # ------------------------------------------------------------------
+    # Fetch current Speechmatics speaker identifiers
+    # ------------------------------------------------------------------
+    try:
+        logger.info("[STT] Calling get_speaker_ids()")
+        raw_speaker_ids = await stt.get_speaker_ids()
+        speaker_ids = normalize_speaker_ids(raw_speaker_ids)
+
+    except Exception:
+        logger.exception("[STT] Failed to obtain speaker identifiers.")
+        return (
+            f"I heard your name is {name}, "
+            "but I couldn't save it because speaker identification failed."
         )
-        updated_speakers.append(new_speaker)
-        logger.info(f"[SPEAKER] Created new {name}")
-        logger.info(f"[SPEAKER] Identifiers: {new_speaker.speaker_identifiers}")
-    
-    known_speakers = updated_speakers
-    save_speakers(SPEAKERS_FILE, updated_speakers)
-    
+
+    if not speaker_ids:
+        logger.warning("[STT] No speaker identifiers returned.")
+        return (
+            f"I heard your name is {name}, "
+            "but I couldn't identify your voice yet."
+        )
+
+    logger.info(f"[STT] Normalized speaker IDs: {speaker_ids}")
+
+    # ------------------------------------------------------------------
+    # Remove duplicate IDs
+    # ------------------------------------------------------------------
+    speaker_ids = list(dict.fromkeys(speaker_ids))
+
+    updated_speakers = list(known_speakers)
+
+    # ------------------------------------------------------------------
+    # Check whether these identifiers already belong to another user
+    # ------------------------------------------------------------------
+    existing_owner = None
+
+    for speaker in updated_speakers:
+        overlap = set(speaker.speaker_identifiers).intersection(speaker_ids)
+
+        if overlap:
+            existing_owner = speaker
+            logger.info(
+                f"[SPEAKER] Matching identifiers already belong to "
+                f"{speaker.label}: {list(overlap)}"
+            )
+            break
+
+    # ------------------------------------------------------------------
+    # Same speaker introducing themselves again
+    # ------------------------------------------------------------------
+    if existing_owner:
+
+        if existing_owner.label.lower() == name.lower():
+
+            merged_ids = sorted(
+                set(existing_owner.speaker_identifiers).union(speaker_ids)
+            )
+
+            existing_owner.speaker_identifiers = merged_ids
+
+            logger.info(
+                f"[SPEAKER] Refreshed identifiers for existing speaker '{name}'."
+            )
+
+        else:
+            logger.warning(
+                f"[SPEAKER] Speaker identifiers already belong to "
+                f"'{existing_owner.label}', not '{name}'."
+            )
+
+            return (
+                f"I already recognize this voice as "
+                f"{existing_owner.label}. "
+                "If you really want to rename this speaker, "
+                "please use a dedicated rename flow."
+            )
+
+    # ------------------------------------------------------------------
+    # Otherwise search by label
+    # ------------------------------------------------------------------
+    else:
+
+        label_match = None
+
+        for speaker in updated_speakers:
+            if speaker.label.lower() == name.lower():
+                label_match = speaker
+                break
+
+        if label_match:
+
+            merged_ids = sorted(
+                set(label_match.speaker_identifiers).union(speaker_ids)
+            )
+
+            label_match.speaker_identifiers = merged_ids
+
+            logger.info(
+                f"[SPEAKER] Added new identifiers to existing label '{name}'."
+            )
+
+        else:
+
+            new_speaker = SpeakerIdentifier(
+                label=name,
+                speaker_identifiers=sorted(speaker_ids),
+            )
+
+            updated_speakers.append(new_speaker)
+
+            logger.info(
+                f"[SPEAKER] Created new speaker '{name}' "
+                f"with identifiers: {speaker_ids}"
+            )
+
+    # ------------------------------------------------------------------
+    # Persist to disk
+    # ------------------------------------------------------------------
+    try:
+        known_speakers = updated_speakers
+        save_speakers(SPEAKERS_FILE, updated_speakers)
+
+        logger.info(
+            f"[SPEAKER] Successfully saved {len(updated_speakers)} speakers."
+        )
+
+    except Exception:
+        logger.exception("[SPEAKER] Failed saving speakers.json")
+        return (
+            f"I recognized your name as {name}, "
+            "but couldn't save it due to an internal error."
+        )
+
     return f"Got it! I'll remember you as {name}."
 
 
@@ -563,14 +811,86 @@ async def search_company_documents(
 
 async def entrypoint(ctx: JobContext):
     global stt, known_speakers
-    logger.info("[WORKER] Starting voice agent worker entrypoint called")
+    logger.info("[WORKER] ================ ENTRYPOINT STARTED ================")
+    logger.info(f"[WORKER] JobContext ctx attributes: {dir(ctx)}")
+    logger.info(f"[WORKER] Job ID: {ctx.job.id}")
     logger.info(f"[WORKER] Room name: {ctx.room.name}")
+    # Try to get room sid from ctx.job or ctx.room
+    room_sid = getattr(ctx.job, "room_sid", None) or getattr(ctx.room, "sid", None) or getattr(ctx.room, "room_sid", None)
+    logger.info(f"[WORKER] Room SID (room_id): {room_sid}")
+    logger.info(f"[WORKER] Room object: {ctx.room}")
+    logger.info(f"[WORKER] ctx has delete_room method: {hasattr(ctx, 'delete_room')}")
     logger.info("[WORKER] Connecting to room...")
+    
+    # Track if we already tried to delete room
+    room_deleted = False
+    
+    async def check_and_delete_room():
+        """Check remaining participants and delete if only agent left"""
+        nonlocal room_deleted
+        if room_deleted:
+            return
+        
+        logger.info("================ ROOM CLEANUP ================")
+        logger.info("Participant disconnected - checking remaining participants...")
+        # Get all remote participants (excluding the agent itself)
+        remote_participants = list(ctx.room.remote_participants.values())
+        human_participants = [
+            p for p in remote_participants 
+            if not (p.identity.startswith("agent-") or p.identity == "voice-agent-rag")
+        ]
+        logger.info(f"Remaining human participants: {len(human_participants)}")
+        if len(human_participants) == 0:
+            logger.info(f"No human participants left. Deleting room: '{ctx.room.name}'")
+            room_deleted = True
+            try:
+                await ctx.delete_room()
+                logger.info(f"✅ Room deleted successfully: name='{ctx.room.name}'")
+            except Exception as e:
+                logger.exception(f"❌ Failed to delete room: name='{ctx.room.name}'")
+        logger.info("==============================================")
+    
+    # Add shutdown callback using LiveKit's official ctx.add_shutdown_callback
+    async def on_shutdown():
+        logger.info("[WORKER] LiveKit shutdown callback triggered! Cleaning up...")
+        if not room_deleted:
+            await check_and_delete_room()
+    ctx.add_shutdown_callback(on_shutdown)
 
     await ctx.connect(
         auto_subscribe=AutoSubscribe.AUDIO_ONLY,
     )
     logger.info("[WORKER] Successfully connected to room!")
+
+    # Helper function to send agent status to frontend via data channel
+    async def send_agent_status(status: str, tool_name: str | None = None):
+        payload = {
+            "type": "agent_status",
+            "status": status
+        }
+        if tool_name:
+            payload["tool_name"] = tool_name
+        try:
+            await ctx.room.local_participant.publish_data(
+                json.dumps(payload).encode("utf-8"),
+                reliable=True
+            )
+            logger.info(f"[AGENT STATUS] Sent: {payload}")
+        except Exception as e:
+            logger.error(f"[AGENT STATUS] Failed to send: {e}")
+
+    # Create wrapper for function tools that sends status events
+    def tool_wrapper(func, tool_name):
+        async def wrapped(*args, **kwargs):
+            await send_agent_status("calling_tool", tool_name)
+            try:
+                result = await func(*args, **kwargs)
+                await send_agent_status("generating_response")
+                return result
+            except Exception as e:
+                await send_agent_status("tool_failed", tool_name)
+                raise
+        return wrapped
 
     # Register all room event listeners
     @ctx.room.on("participant_connected")
@@ -578,6 +898,8 @@ async def entrypoint(ctx: JobContext):
         logger.info(
             f"[ROOM EVENT] Participant connected: identity={participant.identity}, sid={participant.sid}"
         )
+        current_room_sid = getattr(ctx.job, "room_sid", None) or getattr(ctx.room, "sid", None) or getattr(ctx.room, "room_sid", None)
+        logger.info(f"[ROOM EVENT] Current room name: {ctx.room.name}, room sid: {current_room_sid}")
         if VERBOSE_LOGGING:
             anam_logger.info(f"[ANAM] PARTICIPANT CONNECTED: {participant.identity}")
 
@@ -602,14 +924,20 @@ async def entrypoint(ctx: JobContext):
         logger.info(
             f"[ROOM EVENT] Participant disconnected: identity={participant.identity}, sid={participant.sid}"
         )
+        current_room_sid = getattr(ctx.job, "room_sid", None) or getattr(ctx.room, "sid", None) or getattr(ctx.room, "room_sid", None)
+        logger.info(f"[ROOM EVENT] Current room name: {ctx.room.name}, room sid: {current_room_sid}")
         if VERBOSE_LOGGING:
             anam_logger.info(f"[ANAM] PARTICIPANT DISCONNECTED: {participant.identity}")
+        # Schedule check for deleting room
+        asyncio.create_task(check_and_delete_room())
 
     @ctx.room.on("track_published")
     def on_track_published(publication, participant):
         logger.info(
             f"[ROOM EVENT] Track published: kind={publication.kind}, participant={participant.identity}"
         )
+        current_room_sid = getattr(ctx.job, "room_sid", None) or getattr(ctx.room, "sid", None) or getattr(ctx.room, "room_sid", None)
+        logger.info(f"[ROOM EVENT] Current room name: {ctx.room.name}, room sid: {current_room_sid}")
         if VERBOSE_LOGGING:
             anam_logger.info(
                 f"[ANAM] TRACK PUBLISHED: {participant.identity} {publication.kind}"
@@ -617,6 +945,11 @@ async def entrypoint(ctx: JobContext):
 
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(track, publication, participant):
+        logger.info(
+            f"[ROOM EVENT] Track subscribed: kind={track.kind}, participant={participant.identity}"
+        )
+        current_room_sid = getattr(ctx.job, "room_sid", None) or getattr(ctx.room, "sid", None) or getattr(ctx.room, "room_sid", None)
+        logger.info(f"[ROOM EVENT] Current room name: {ctx.room.name}, room sid: {current_room_sid}")
         if VERBOSE_LOGGING:
             anam_logger.info(
                 f"[ANAM] TRACK SUBSCRIBED: {participant.identity} {track.kind}"
@@ -657,10 +990,34 @@ async def entrypoint(ctx: JobContext):
     
     logger.info("[SPEAKER] STT initialized successfully")
 
-    # Initialize the agent with tools
+    # Wrap the tools with status sending
+    wrapped_assign_name = tool_wrapper(assign_name_2_speaker_ids, "assign_name_2_speaker_ids")
+    wrapped_search_docs = tool_wrapper(search_company_documents, "search_company_documents")
+
+    # Create wrapped function tools
+    from livekit.agents import function_tool
+    @function_tool
+    async def wrapped_assign_name_2_speaker_ids(
+        name: Annotated[
+            str,
+            "The name of the current speaker to remember",
+        ],
+    ) -> str:
+        return await wrapped_assign_name(name)
+
+    @function_tool
+    async def wrapped_search_company_documents(
+        question: Annotated[
+            str,
+            "Question regarding uploaded company documents, policies, manuals, procedures, SOPs, internal knowledge base or enterprise documents",
+        ],
+    ) -> str:
+        return await wrapped_search_docs(question)
+
+    # Initialize the agent with wrapped tools
     agent = Agent(
         instructions=SYSTEM_PROMPT,
-        tools=[assign_name_2_speaker_ids, search_company_documents],
+        tools=[wrapped_assign_name_2_speaker_ids, wrapped_search_company_documents],
     )
 
     # LLM startup checks and initialization
@@ -671,7 +1028,7 @@ async def entrypoint(ctx: JobContext):
         llm_logger.info(f"[LLM CHECK] HF_TOKEN exists: {bool(hf_token)}")
 
     llm_logger.info("[LLM INIT] Loading Hugging Face LLM")
-    llm_logger.info("[LLM INIT] Model: Qwen/Qwen2.5-7B-Instruct")
+    llm_logger.info(f"[LLM INIT] Model: {settings.HF_LLM_MODEL}")
     
     if not hf_token:
         llm_logger.error("[LLM ERROR] HF_TOKEN environment variable not found.")
@@ -679,7 +1036,7 @@ async def entrypoint(ctx: JobContext):
 
     # Initialize custom HuggingFace LLM
     llm_instance = HuggingFaceLLM(
-        model="Qwen/Qwen2.5-7B-Instruct",
+        model=settings.HF_LLM_MODEL,
         api_key=hf_token,
         provider="auto",
         temperature=0.7,
@@ -733,6 +1090,10 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"\n[CONVERSATION STATE]")
         logger.info(f"Previous: {old_state}")
         logger.info(f"Current: {new_state}")
+
+        # Send status to frontend
+        if new_state in ["listening", "speaking", "thinking"]:
+            asyncio.create_task(send_agent_status(new_state))
 
         if new_state == "listening" and old_state == "speaking":
             logger.info(f"\n[TTS END]")
@@ -797,6 +1158,7 @@ async def entrypoint(ctx: JobContext):
     await session.start(
         agent=agent,
         room=ctx.room,
+        room_input_options=RoomInputOptions(close_on_disconnect=False),
     )
     logger.info("[WORKER] AgentSession started successfully! Now listening for user input!")
 
